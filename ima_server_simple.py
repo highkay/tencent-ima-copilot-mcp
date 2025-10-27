@@ -7,6 +7,7 @@ IMA Copilot MCP 服务器 - 基于环境变量的简化版本
 import logging
 import sys
 from pathlib import Path
+from datetime import datetime
 
 from fastmcp import FastMCP
 
@@ -17,13 +18,32 @@ from config import config_manager, get_config, get_app_config
 from ima_client import IMAAPIClient
 from models import IMAStatus
 
-# 配置日志
+# 配置详细的调试日志
 app_config = get_app_config()
+
+# 创建日志目录
+log_dir = Path("logs/debug")
+log_dir.mkdir(parents=True, exist_ok=True)
+
+# 生成带时间戳的日志文件
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = log_dir / f"ima_server_{timestamp}.log"
+
+# 配置日志处理器
 logging.basicConfig(
-    level=getattr(logging, app_config.log_level.upper()),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG,  # 强制使用DEBUG级别
+    format="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
+
 logger = logging.getLogger(__name__)
+logger.info(f"调试日志已启用，日志文件: {log_file}")
+
+# 确保ima_client使用DEBUG级别
+logging.getLogger('ima_client').setLevel(logging.DEBUG)
 
 # 创建 FastMCP 实例
 mcp = FastMCP("IMA Copilot")
@@ -53,8 +73,14 @@ async def ask(question: str) -> str:
             return "[ERROR] 配置未完成，请检查环境变量设置"
 
         try:
+            # 启用原始SSE日志
+            config.enable_raw_logging = True
+            config.raw_log_dir = "logs/debug/raw"
+            config.raw_log_on_success = False  # 只在失败时保存
+            
             ima_client = IMAAPIClient(config)
             logger.info("IMA 客户端初始化成功")
+            logger.info(f"原始SSE日志已启用: {config.raw_log_dir}")
         except Exception as e:
             logger.error(f"初始化 IMA 客户端失败: {e}")
             return f"[ERROR] IMA 客户端初始化失败: {str(e)}"

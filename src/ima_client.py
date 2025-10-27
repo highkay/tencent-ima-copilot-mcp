@@ -7,6 +7,7 @@ import logging
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 from urllib.parse import unquote
 
@@ -46,6 +47,94 @@ class IMAAPIClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.current_session_id: Optional[str] = None
         self.session_initialized: bool = False
+        self.raw_log_dir: Optional[Path] = None
+
+        if getattr(self.config, "enable_raw_logging", False):
+            raw_dir_value = getattr(self.config, "raw_log_dir", None)
+            raw_dir = Path(raw_dir_value) if raw_dir_value else Path("logs") / "sse_raw"
+            try:
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                self.raw_log_dir = raw_dir
+                logger.info(f"Raw SSE logs will be written to: {raw_dir}")
+            except Exception as exc:
+                logger.error(f"Failed to prepare raw SSE log directory: {exc}")
+
+    def _should_persist_raw(self, stream_error: Optional[str]) -> bool:
+        """判断当前是否需要保存原始SSE响应"""
+        if not self.raw_log_dir or not getattr(self.config, "enable_raw_logging", False):
+            return False
+
+        if stream_error:
+            return True  # always persist on errors
+
+        return getattr(self.config, "raw_log_on_success", False)
+
+    def _persist_raw_response(
+        self,
+        trace_id: str,
+        attempt_index: int,
+        question: Optional[str],
+        full_response: str,
+        message_count: int,
+        parsed_message_count: int,
+        failed_parse_count: int,
+        elapsed_time: float,
+        stream_error: Optional[str],
+    ) -> Optional[Path]:
+        """将原始SSE响应落盘，便于排查问题"""
+        if not self._should_persist_raw(stream_error):
+            return None
+
+        assert self.raw_log_dir is not None  # for type checkers
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        suffix = f"attempt{attempt_index + 1}"
+        filename = f"sse_{timestamp}_{trace_id}_{suffix}.log"
+        target_path = self.raw_log_dir / filename
+
+        max_bytes = getattr(self.config, "raw_log_max_bytes", 0) or 0
+        encoded = full_response.encode("utf-8", errors="replace")
+        response_bytes = len(encoded)
+        truncated = False
+
+        if max_bytes > 0 and response_bytes > max_bytes:
+            encoded = encoded[:max_bytes]
+            truncated = True
+
+        preview_question = None
+        if question:
+            preview_question = question.strip()
+            if len(preview_question) > 200:
+                preview_question = preview_question[:200] + "..."
+
+        metadata = {
+            "timestamp": datetime.now().isoformat(),
+            "trace_id": trace_id,
+            "attempt": attempt_index + 1,
+            "question": preview_question,
+            "message_count": message_count,
+            "parsed_message_count": parsed_message_count,
+            "failed_parse_count": failed_parse_count,
+            "elapsed_seconds": round(elapsed_time, 3),
+            "response_bytes": response_bytes,
+            "truncated": truncated,
+            "stream_error": stream_error,
+        }
+
+        try:
+            header = json.dumps(metadata, ensure_ascii=False, indent=2)
+            body = encoded.decode("utf-8", errors="replace")
+
+            with target_path.open("w", encoding="utf-8") as fp:
+                fp.write(header)
+                fp.write("\n\n")
+                fp.write(body)
+
+            logger.info(f"Raw SSE response saved to {target_path} (trace_id={trace_id})")
+            return target_path
+        except Exception as exc:
+            logger.error(f"Failed to persist raw SSE response: {exc}")
+            return None
 
     def _is_token_expired(self) -> bool:
         """检查token是否过期"""
@@ -65,15 +154,16 @@ class IMAAPIClient:
             match = re.search(uid_pattern, self.config.x_ima_cookie)
             if match:
                 uid = match.group(1)
-                logger.info(f"成功解析IMA-UID: {uid}")
+                logger.debug(f"成功解析IMA-UID: {uid}")
                 return uid
 
             # 如果在IMA_X_IMA_COOKIE中没找到，尝试从cookies中查找
             user_id_pattern = r"user_id=([a-f0-9]{16})"
-            match = re.search(user_id_pattern, self.config.cookies)
-            if match:
-                logger.info(f"从cookies中解析user_id: {match.group(1)}")
-                return match.group(1)
+            if self.config.cookies:
+                match = re.search(user_id_pattern, self.config.cookies)
+                if match:
+                    logger.info(f"从cookies中解析user_id: {match.group(1)}")
+                    return match.group(1)
         except Exception as e:
             logger.warning(f"解析user_id失败: {e}")
         return None
@@ -92,10 +182,11 @@ class IMAAPIClient:
 
             # 如果在IMA_X_IMA_COOKIE中没找到，尝试从cookies中查找
             refresh_token_pattern = r"refresh_token=([^;]+)"
-            match = re.search(refresh_token_pattern, self.config.cookies)
-            if match:
-                logger.info(f"从cookies中解析refresh_token: {match.group(1)[:20]}...")
-                return match.group(1)
+            if self.config.cookies:
+                match = re.search(refresh_token_pattern, self.config.cookies)
+                if match:
+                    logger.info(f"从cookies中解析refresh_token: {match.group(1)[:20]}...")
+                    return match.group(1)
         except Exception as e:
             logger.warning(f"解析IMA-TOKEN失败: {e}")
         return None
@@ -243,7 +334,7 @@ class IMAAPIClient:
             self.session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
-                cookies=self._parse_cookies(self.config.cookies),
+                cookies=self._parse_cookies(self.config.cookies or ""),
                 headers=self._build_headers(for_init_session),
                 trust_env=True,
                 # 增加读取缓冲区大小
@@ -320,18 +411,25 @@ class IMAAPIClient:
     def _parse_sse_message(self, line: str) -> Optional[IMAMessage]:
         """解析 SSE 消息"""
         try:
+            # 记录原始行内容用于调试
+            logger.debug(f"尝试解析SSE行 (长度: {len(line)}): {line[:200]}...")
+            
             # 处理标准 SSE 格式
             if line.startswith('data: '):
                 data = line[6:]  # 移除 'data: ' 前缀
+                logger.debug(f"标准SSE格式，data长度: {len(data)}")
             elif line.startswith('event: ') or line.startswith('id: '):
                 # SSE 控制消息，跳过
+                logger.debug(f"跳过SSE控制消息: {line[:50]}...")
                 return None
             else:
                 # 非标准格式，直接使用
                 data = line
+                logger.debug(f"非标准SSE格式，直接使用原始数据，长度: {len(data)}")
 
             # 跳过空行和结束标记
             if not data or data == '[DONE]' or data.strip() == '':
+                logger.debug("跳过空行或结束标记")
                 return None
 
             # 解析 JSON 数据
@@ -341,7 +439,7 @@ class IMAAPIClient:
             # 格式1: 包含消息列表的响应
             if 'msgs' in json_data and isinstance(json_data['msgs'], list):
                 # 这是最终响应，包含多个消息
-                for msg in json_data['msgs']:
+                for i, msg in enumerate(json_data['msgs']):
                     if isinstance(msg, dict) and 'content' in msg:
                         # 提取内容
                         content = msg.get('content', '')
@@ -401,30 +499,62 @@ class IMAAPIClient:
             )
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning(f"Failed to parse SSE message: {e}, line: {line[:100]}...")
-            return None
+            logger.debug(f"Failed to parse SSE message: {e}, line: {line[:100]}...")
+            raise  # Re-raise the exception to be caught upstream
 
-    async def _process_sse_stream(self, response: aiohttp.ClientResponse) -> AsyncGenerator[IMAMessage, None]:
+    async def _process_sse_stream(
+        self,
+        response: aiohttp.ClientResponse,
+        *,
+        trace_id: str,
+        attempt_index: int,
+        question: Optional[str],
+    ) -> AsyncGenerator[IMAMessage, None]:
         """处理 SSE 流 - 完整处理所有消息"""
         buffer = ""
         full_response = ""
         message_count = 0
-        no_data_timeout = 60  # 增加到60秒无数据超时，适合长响应
+        parsed_message_count = 0  # 成功解析的消息数
+        failed_parse_count = 0  # 解析失败的chunk数
+        no_data_timeout = 120  # 增加到120秒无数据超时,与total timeout一致
+        chunk_timeout = 60  # 增加到60秒以处理慢速响应
         last_data_time = asyncio.get_event_loop().time()
         start_time = asyncio.get_event_loop().time()
+        has_received_data = False  # 标记是否收到过数据
+        first_chunk_logged = False  # 是否已记录第一个chunk
+        sample_chunks = []  # 保存前10个chunk样本用于分析
+
+        stream_error: Optional[str] = None
+        raw_log_path: Optional[Path] = None
+
+        # 记录开始处理SSE流
+        logger.debug(f"开始处理SSE流 (trace_id={trace_id}, attempt={attempt_index + 1})")
 
         try:
             async for chunk in response.content:
                 current_time = asyncio.get_event_loop().time()
 
-                # 检查超时
-                if current_time - last_data_time > no_data_timeout:
-                    logger.warning(f"SSE 流读取超时，无数据时间超过{no_data_timeout}秒")
+                # 动态超时检查:如果已经收到数据,使用较短的chunk超时;否则使用完整超时
+                timeout_threshold = chunk_timeout if has_received_data else no_data_timeout
+                if current_time - last_data_time > timeout_threshold:
+                    logger.warning(f"SSE 流读取超时，无数据时间超过{timeout_threshold}秒 (已处理{message_count}条消息)")
+                    logger.debug(f"超时时的状态 - buffer长度: {len(buffer)}, 已处理数据: {len(full_response)}字节")
+                    logger.debug(f"超时时的统计 - 成功解析: {parsed_message_count}, 失败解析: {failed_parse_count}")
+                    # 不是立即中断,而是尝试解析已接收的数据
                     break
 
                 if chunk:
+                    has_received_data = True
                     last_data_time = current_time
                     message_count += 1
+
+                    # 保存前10个chunk样本
+                    if len(sample_chunks) < 10:
+                        sample_chunks.append({
+                            'chunk_num': message_count,
+                            'size': len(chunk),
+                            'content_preview': chunk.decode('utf-8', errors='ignore')[:100]
+                        })
 
                     try:
                         chunk_str = chunk.decode('utf-8')
@@ -435,85 +565,113 @@ class IMAAPIClient:
                         except UnicodeDecodeError:
                             # 如果都失败，使用错误处理模式
                             chunk_str = chunk.decode('utf-8', errors='ignore')
+                            logger.warning(f"Chunk {message_count} 解码失败，使用ignore模式")
+
+                    first_chunk_logged = True
 
                     buffer += chunk_str
                     full_response += chunk_str
 
                     # 处理完整的行
+                    lines_in_chunk = 0
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         line = line.strip()
+                        lines_in_chunk += 1
 
                         if line:
-                            message = self._parse_sse_message(line)
-                            if message:
-                                yield message
+                            try:
+                                message = self._parse_sse_message(line)
+                                if message:
+                                    parsed_message_count += 1
+                                    yield message
+                            except (json.JSONDecodeError, KeyError, ValueError):
+                                failed_parse_count += 1
 
-                    # 定期报告处理进度（每500条消息）
-                    if message_count % 500 == 0:
-                        elapsed_time = current_time - start_time
-                        logger.info(f"已处理 {message_count} 条消息，耗时 {elapsed_time:.1f} 秒")
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            stream_error = f"SSE timeout: {exc}"
             logger.error("SSE 流读取超时")
             raise
-        except aiohttp.ClientPayloadError as e:
-            logger.error(f"SSE 流数据错误: {e}")
+        except aiohttp.ClientPayloadError as exc:
+            stream_error = f"SSE payload error: {exc}"
+            logger.error(f"SSE 流数据错误: {exc}")
             raise
-        except Exception as e:
-            logger.error(f"SSE 流处理异常: {e}")
-            # 不重新抛出异常，继续尝试解析完整响应
+        except Exception as exc:
+            stream_error = f"SSE exception: {exc}"
+            logger.error(f"SSE 流处理异常: {exc}")
+            raise
         finally:
             # 确保响应被正确关闭
             if not response.closed:
                 response.close()
 
+            elapsed_time = asyncio.get_event_loop().time() - start_time
+            raw_log_path = self._persist_raw_response(
+                trace_id=trace_id,
+                attempt_index=attempt_index,
+                question=question,
+                full_response=full_response,
+                message_count=message_count,
+                parsed_message_count=parsed_message_count,
+                failed_parse_count=failed_parse_count,
+                elapsed_time=elapsed_time,
+                stream_error=stream_error,
+            )
+
         # 处理剩余的缓冲区内容
         if buffer.strip():
             remaining_lines = buffer.strip().split('\n')
-            for line in remaining_lines:
+            for i, line in enumerate(remaining_lines):
                 line = line.strip()
                 if line:
-                    message = self._parse_sse_message(line)
-                    if message:
-                        yield message
+                    try:
+                        message = self._parse_sse_message(line)
+                        if message:
+                            parsed_message_count += 1
+                            yield message
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        failed_parse_count += 1
 
         # 如果没有从 SSE 流中解析到足够消息，尝试将整个响应作为 JSON 处理
         # 这是为了处理 IMA 可能返回的完整 JSON 响应
-        if message_count < 100:  # 只有在消息较少时才尝试完整解析
-            logger.debug(f"消息数量较少({message_count})，尝试完整解析响应...")
-
+        if message_count < 100 or not has_received_data:  # 消息较少或没收到数据时尝试完整解析
             # 尝试解析整个响应为 JSON
             try:
                 if full_response.strip():
                     response_data = json.loads(full_response.strip())
-                    logger.debug("成功解析完整响应为 JSON")
-
                     # 尝试从响应中提取有用信息
                     messages = self._extract_messages_from_response(response_data)
                     for message in messages:
                         yield message
-                else:
-                    logger.debug("响应内容为空")
 
             except json.JSONDecodeError as e:
-                logger.debug(f"无法解析完整响应为 JSON: {e}")
-
                 # 最后尝试：逐行解析响应
                 if full_response:
                     lines = full_response.split('\n')
-                    for line in lines:
+                    for i, line in enumerate(lines):
                         line = line.strip()
                         if line and line != '[DONE]':
                             message = self._parse_sse_message(line)
                             if message:
+                                parsed_message_count += 1
                                 yield message
-                else:
-                    logger.debug("没有可用的响应数据")
+                            else:
+                                failed_parse_count += 1
 
         # 记录最终处理统计
         elapsed_time = asyncio.get_event_loop().time() - start_time
-        logger.info(f"SSE 流处理完成: {message_count} 条消息，响应大小 {len(full_response)} 字节，耗时 {elapsed_time:.1f} 秒")
+        parse_rate = (parsed_message_count / message_count * 100) if message_count > 0 else 0
+        extra_info = f"，原始日志: {raw_log_path}" if raw_log_path else ""
+        logger.info(f"SSE 流处理结束: {message_count} 条chunk，成功解析 {parsed_message_count} 条消息，"
+                   f"失败 {failed_parse_count} 条，解析率 {parse_rate:.1f}%，响应大小 {len(full_response)} 字节，耗时 {elapsed_time:.1f} 秒{extra_info}")
+
+        # 诊断性日志
+        # 诊断性日志 - 仅在出现严重解析问题时记录
+        if message_count > 100 and parsed_message_count < 5:
+            logger.error(f"严重: 收到 {message_count} 个chunk但只解析出 {parsed_message_count} 条消息，"
+                        f"解析率 {(parsed_message_count/message_count*100):.1f}%")
+            logger.debug(f"前10个chunk样本: {sample_chunks}")
 
     def _extract_messages_from_response(self, response_data: Dict[str, Any]) -> List[IMAMessage]:
         """从完整响应中提取消息 - 只关注qa返回的msgs中最后一个对象"""
@@ -697,8 +855,12 @@ class IMAAPIClient:
         url = f"{self.base_url}{self.api_endpoint}"
         request_json = request_data.model_dump()
 
-        logger.info(f"请求URL: {url}")
-        logger.info(f"请求参数: {json.dumps(request_json, ensure_ascii=False, indent=2)}")
+        logger.debug(f"请求URL: {url}")
+        logger.debug(f"请求参数: {json.dumps(request_json, ensure_ascii=False, indent=2)}")
+
+        # 生成trace_id用于跟踪
+        trace_id = str(uuid.uuid4())[:8]
+        logger.debug(f"本次请求trace_id: {trace_id}")
 
         response = None
         try:
@@ -723,21 +885,34 @@ class IMAAPIClient:
                 # 读取响应内容进行诊断
                 response_text = await response.text()
                 logger.error(f"意外的响应类型: {content_type}")
-                logger.error(f"响应内容: {response_text[:500]}...")
+                
+                if not response_text.strip():
+                    logger.error("收到了空的错误响应内容。")
+                    raise ValueError(f"Expected SSE response, got {content_type} with empty body. 可能原因: 1) 认证信息错误 2) 请求参数问题 3) API端点变更")
+
+                logger.error(f"响应内容 (前1000字符): {response_text[:1000]}")
 
                 # 尝试解析JSON错误响应
                 try:
                     error_data = json.loads(response_text)
-                    logger.error(f"API错误响应: {json.dumps(error_data, ensure_ascii=False, indent=2)}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"无法解析错误响应为JSON: {e}")
+                    error_msg = error_data.get('msg', '未知错误')
+                    error_code = error_data.get('code', 'N/A')
+                    logger.error(f"API错误响应 (code: {error_code}): {error_msg}")
+                    logger.debug(f"完整错误详情: {json.dumps(error_data, ensure_ascii=False, indent=2)}")
+                    raise ValueError(f"API返回错误 (code: {error_code}): {error_msg}")
+                except json.JSONDecodeError:
+                    logger.error("无法将错误响应解析为JSON。")
                     logger.error(f"原始响应内容: {response_text}")
-
-                raise ValueError(f"Expected SSE response, got {content_type}. 可能原因: 1) 认证信息错误 2) 请求参数问题 3) API端点变更")
+                    raise ValueError(f"预期的SSE响应，但收到 {content_type}。响应无法解析为JSON: {response_text[:200]}")
 
             # 处理流式响应
             message_count = 0
-            async for message in self._process_sse_stream(response):
+            async for message in self._process_sse_stream(
+                response,
+                trace_id=trace_id,
+                attempt_index=0,
+                question=question
+            ):
                 message_count += 1
                 yield message
 
@@ -782,7 +957,8 @@ class IMAAPIClient:
             "会话已过期",
             "请重新登录",
             "unauthorized",
-            "401"
+            "401",
+            "Expected SSE response",  # 服务器返回非SSE响应通常意味着会话/认证失败
         ]
 
         error_lower = error_str.lower()
@@ -792,14 +968,20 @@ class IMAAPIClient:
         """获取完整的问题回答 - 支持自动 token 刷新重试"""
         messages = []
         max_retries = 2  # 最大重试次数
+        
+        # 生成主trace_id用于整个请求
+        main_trace_id = str(uuid.uuid4())[:8]
+        logger.info(f"开始完整问答请求 (main_trace_id={main_trace_id})")
 
         for attempt in range(max_retries + 1):  # 总共尝试 max_retries + 1 次
+            logger.info(f"尝试 {attempt + 1}/{max_retries + 1} (main_trace_id={main_trace_id})")
             try:
                 async for message in self.ask_question(question):
                     messages.append(message)
 
                 # 如果成功获取到消息，直接返回
                 if messages:
+                    logger.info(f"成功获取 {len(messages)} 条消息 (main_trace_id={main_trace_id})")
                     break
 
             except Exception as e:
@@ -869,7 +1051,7 @@ class IMAAPIClient:
         # 清理和格式化结果
         final_result = self._clean_response_content(final_result)
 
-        logger.info(f"最终响应内容长度: {len(final_result)}")
+        logger.debug(f"最终响应内容长度: {len(final_result)}")
         return final_result
 
     def _clean_response_content(self, content: str) -> str:

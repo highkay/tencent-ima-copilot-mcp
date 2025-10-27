@@ -7,13 +7,67 @@ IMA Copilot MCP 服务器启动脚本
 import sys
 import os
 import subprocess
+import logging
 from pathlib import Path
+from datetime import datetime
 
 # 设置控制台编码
 if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+def setup_debug_logging():
+    """设置详细的调试日志"""
+    # 创建日志目录
+    log_dir = Path("logs/debug")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 生成带时间戳的日志文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"ima_debug_{timestamp}.log"
+    
+    # 配置根日志记录器
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    
+    # 移除现有的处理器
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # 创建文件处理器 - 详细日志
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 创建控制台处理器 - 只显示INFO及以上
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # 创建格式化器
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    simple_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 设置格式化器
+    file_handler.setFormatter(detailed_formatter)
+    console_handler.setFormatter(simple_formatter)
+    
+    # 添加处理器
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    # 配置ima_client日志记录器
+    ima_logger = logging.getLogger('ima_client')
+    ima_logger.setLevel(logging.DEBUG)
+    
+    print(f"✅ 调试日志已启用，日志文件: {log_file}")
+    return log_file
 
 def check_env_file():
     """检查 .env 文件是否存在"""
@@ -139,6 +193,9 @@ def main():
     """主启动函数"""
     print("IMA Copilot MCP 服务器启动检查")
     print("=" * 40)
+    
+    # 启用调试日志
+    log_file = setup_debug_logging()
 
     # 检查配置文件
     if not check_env_file():
@@ -150,6 +207,9 @@ def main():
 
     # 显示启动信息
     show_startup_info()
+    
+    print(f"\n📝 调试日志文件: {log_file}")
+    print("   所有调试信息将保存到此文件")
 
     # 根据命令行参数选择启动方式
     if len(sys.argv) > 1:

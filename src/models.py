@@ -183,6 +183,10 @@ class IMAConfig(BaseModel):
     proxy: Optional[str] = Field(None, description="代理设置")
     timeout: int = Field(30, description="请求超时时间（秒）")
     retry_count: int = Field(3, description="重试次数")
+    enable_raw_logging: bool = Field(False, description="Enable writing raw SSE responses to disk")
+    raw_log_dir: Optional[str] = Field(None, description="Directory for raw SSE logs")
+    raw_log_max_bytes: int = Field(1048576, description="Maximum bytes saved per raw response")
+    raw_log_on_success: bool = Field(False, description="Save raw response even when successful")
 
     # 元数据
     created_at: datetime = Field(default_factory=datetime.now)
