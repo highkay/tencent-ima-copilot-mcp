@@ -301,7 +301,16 @@ class IMAAPIClient:
         # 如果有当前token，添加到请求头
         if self.config.current_token:
             headers["authorization"] = f"Bearer {self.config.current_token}"
+            logger.debug(f"已添加 authorization 请求头 (token前20字符): {self.config.current_token[:20]}...")
+        else:
+            logger.debug("未添加 authorization 请求头 (无current_token)")
 
+        # 记录关键请求头（隐藏敏感信息）
+        logger.debug(f"构建请求头 - for_init_session={for_init_session}")
+        logger.debug(f"  x-ima-cookie 长度: {len(self.config.x_ima_cookie)}")
+        logger.debug(f"  x-ima-bkn: {self.config.x_ima_bkn}")
+        logger.debug(f"  cookies 长度: {len(self.config.cookies or '')}")
+        
         return headers
 
     async def _get_session(self, for_init_session: bool = False) -> aiohttp.ClientSession:
@@ -411,26 +420,16 @@ class IMAAPIClient:
     def _parse_sse_message(self, line: str) -> Optional[IMAMessage]:
         """解析 SSE 消息"""
         try:
-            # 记录原始行内容用于调试
-            logger.debug(f"尝试解析SSE行 (长度: {len(line)}): {line[:200]}...")
-            
-            # 处理标准 SSE 格式
+            # 优化日志：移除逐行解析的DEBUG日志，减少日志量
             if line.startswith('data: '):
-                data = line[6:]  # 移除 'data: ' 前缀
-                logger.debug(f"标准SSE格式，data长度: {len(data)}")
-            elif line.startswith('event: ') or line.startswith('id: '):
-                # SSE 控制消息，跳过
-                logger.debug(f"跳过SSE控制消息: {line[:50]}...")
-                return None
+                data = line[6:]
+            elif line.startswith(('event: ', 'id: ')):
+                return None  # 跳过SSE控制消息
             else:
-                # 非标准格式，直接使用
                 data = line
-                logger.debug(f"非标准SSE格式，直接使用原始数据，长度: {len(data)}")
 
-            # 跳过空行和结束标记
-            if not data or data == '[DONE]' or data.strip() == '':
-                logger.debug("跳过空行或结束标记")
-                return None
+            if not data or data == '[DONE]' or not data.strip():
+                return None  # 跳过空行或结束标记
 
             # 解析 JSON 数据
             json_data = json.loads(data)
@@ -663,8 +662,10 @@ class IMAAPIClient:
         elapsed_time = asyncio.get_event_loop().time() - start_time
         parse_rate = (parsed_message_count / message_count * 100) if message_count > 0 else 0
         extra_info = f"，原始日志: {raw_log_path}" if raw_log_path else ""
-        logger.info(f"SSE 流处理结束: {message_count} 条chunk，成功解析 {parsed_message_count} 条消息，"
-                   f"失败 {failed_parse_count} 条，解析率 {parse_rate:.1f}%，响应大小 {len(full_response)} 字节，耗时 {elapsed_time:.1f} 秒{extra_info}")
+        logger.info(f"SSE 流处理结束: 收到 {message_count} 个数据块, "
+                   f"成功解析 {parsed_message_count} 条消息, "
+                   f"失败 {failed_parse_count} 次, "
+                   f"响应大小 {len(full_response)} 字节, 耗时 {elapsed_time:.1f} 秒{extra_info}")
 
         # 诊断性日志
         # 诊断性日志 - 仅在出现严重解析问题时记录
@@ -774,12 +775,20 @@ class IMAAPIClient:
         # 使用配置中的知识库ID，如果没有提供参数
         kb_id = knowledge_base_id or getattr(self.config, 'knowledge_base_id', '7305806844290061')
 
+        logger.info("=" * 60)
+        logger.info("开始初始化会话 (init_session)")
+        logger.info(f"知识库ID: {kb_id}")
+        
         # 确保token有效
         if not await self.ensure_valid_token():
             logger.error("无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
 
         session = await self._get_session(for_init_session=True)
+        
+        # 记录当前会话的cookies和headers
+        logger.info(f"会话cookies数量: {len(session.cookie_jar)}")
+        logger.info(f"会话headers: {dict(session.headers)}")
 
         # 构建初始化请求
         init_request = InitSessionRequest(
@@ -805,11 +814,29 @@ class IMAAPIClient:
         logger.info(f"初始化会话参数: {json.dumps(request_json, ensure_ascii=False, indent=2)}")
 
         try:
+            # 获取实际要发送的请求头
+            actual_headers = dict(session.headers)
+            actual_headers.update({"content-type": "application/json"})
+            logger.info("实际请求头（隐藏敏感信息）:")
+            for key, value in actual_headers.items():
+                if key.lower() in ['x-ima-cookie', 'authorization', 'cookie']:
+                    logger.info(f"  {key}: [已隐藏，长度={len(str(value))}]")
+                else:
+                    logger.info(f"  {key}: {value}")
+            
             async with session.post(
                 url,
                 json=request_json,
                 headers={"content-type": "application/json"}
             ) as response:
+                logger.info(f"收到响应，状态码: {response.status}")
+                
+                if response.status != 200:
+                    response_text = await response.text()
+                    logger.error(f"初始化会话失败，HTTP状态码: {response.status}")
+                    logger.error(f"响应内容: {response_text}")
+                    raise ValueError(f"init_session HTTP错误 {response.status}: {response_text[:500]}")
+                
                 response.raise_for_status()
 
                 response_data = await response.json()
@@ -847,7 +874,13 @@ class IMAAPIClient:
         # 如果会话未初始化，先初始化会话
         if not self.session_initialized or not self.current_session_id:
             logger.info("会话未初始化，开始初始化...")
-            await self.init_session()
+            try:
+                await self.init_session()
+                logger.info(f"会话初始化成功，session_id: {self.current_session_id}")
+            except Exception as init_error:
+                logger.error(f"会话初始化失败: {init_error}")
+                logger.error("这可能是导致 'No valid session ID provided' 错误的原因")
+                raise
 
         session = await self._get_session()
         request_data = self._build_request(question)
@@ -864,6 +897,9 @@ class IMAAPIClient:
 
         response = None
         try:
+            logger.info(f"发送问题到 {url}")
+            logger.info(f"使用 session_id: {request_json.get('session_id', 'N/A')}")
+            
             response = await session.post(
                 url,
                 json=request_json,
@@ -875,6 +911,18 @@ class IMAAPIClient:
                 response_text = await response.text()
                 logger.error(f"HTTP请求失败，状态码: {response.status}")
                 logger.error(f"响应内容: {response_text[:500]}...")
+                
+                # 特别检查 400 错误和 session ID 相关的问题
+                if response.status == 400:
+                    logger.error("=" * 60)
+                    logger.error("收到 HTTP 400 错误 - 可能的原因:")
+                    logger.error("1. session_id 无效或已过期")
+                    logger.error("2. 认证信息（cookies/headers）无效")
+                    logger.error("3. 请求参数格式错误")
+                    logger.error(f"当前使用的 session_id: {self.current_session_id}")
+                    logger.error(f"会话初始化状态: {self.session_initialized}")
+                    logger.error("=" * 60)
+                
                 raise ValueError(f"HTTP请求失败: {response.status} - {response_text[:200]}")
 
             # 检查响应类型

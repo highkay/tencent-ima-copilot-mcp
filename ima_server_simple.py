@@ -31,7 +31,7 @@ log_file = log_dir / f"ima_server_{timestamp}.log"
 
 # 配置日志处理器
 logging.basicConfig(
-    level=logging.DEBUG,  # 强制使用DEBUG级别
+    level=logging.INFO,  # 强制使用DEBUG级别
     format="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
     handlers=[
         logging.FileHandler(log_file, encoding='utf-8'),
