@@ -42,8 +42,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info(f"调试日志已启用，日志文件: {log_file}")
 
-# 确保ima_client使用DEBUG级别
-logging.getLogger('ima_client').setLevel(logging.DEBUG)
+# 确保ima_client使用INFO级别
+logging.getLogger('ima_client').setLevel(logging.INFO)
 
 # 创建 FastMCP 实例
 mcp = FastMCP("IMA Copilot")

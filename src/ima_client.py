@@ -169,38 +169,96 @@ class IMAAPIClient:
         return None
 
     def _parse_refresh_token_from_cookies(self) -> Optional[str]:
-        """从IMA_X_IMA_COOKIE中解析IMA-TOKEN（用于刷新token）"""
+        """从IMA_X_IMA_COOKIE中解析IMA-REFRESH-TOKEN（用于刷新token）"""
         try:
-            # 从IMA_X_IMA_COOKIE中提取IMA-TOKEN
             import re
+            
+            logger.debug(f"开始解析 refresh_token")
+            logger.debug(f"  x_ima_cookie 长度: {len(self.config.x_ima_cookie)}")
+            logger.debug(f"  x_ima_cookie 前100字符: {self.config.x_ima_cookie[:100]}...")
+            
+            # 优先尝试解析 IMA-REFRESH-TOKEN（这是正确的刷新令牌）
+            refresh_token_pattern = r"IMA-REFRESH-TOKEN=([^;]+)"
+            match = re.search(refresh_token_pattern, self.config.x_ima_cookie)
+            if match:
+                token = match.group(1)
+                decoded_token = unquote(token)
+                if decoded_token != token:
+                    logger.info(f"IMA-REFRESH-TOKEN 已进行 URL 解码")
+                    logger.info(f"  原始长度: {len(token)}, 解码后长度: {len(decoded_token)}")
+                    token = decoded_token
+                
+                logger.info(f"✓ 成功从 x_ima_cookie 解析 IMA-REFRESH-TOKEN")
+                logger.info(f"  长度: {len(token)}")
+                logger.info(f"  前20字符: {token[:20]}...")
+                logger.info(f"  后10字符: ...{token[-10:]}")
+                return token
+            
+            logger.warning("在 x_ima_cookie 中未找到 IMA-REFRESH-TOKEN")
+            
+            # 如果找不到 IMA-REFRESH-TOKEN，尝试回退到 IMA-TOKEN
             token_pattern = r"IMA-TOKEN=([^;]+)"
             match = re.search(token_pattern, self.config.x_ima_cookie)
             if match:
                 token = match.group(1)
-                logger.info(f"成功解析IMA-TOKEN: {token[:20]}...")
+                decoded_token = unquote(token)
+                if decoded_token != token:
+                    token = decoded_token
+                
+                logger.warning(f"⚠ 使用 IMA-TOKEN 作为 refresh_token（应该使用 IMA-REFRESH-TOKEN）")
+                logger.info(f"  长度: {len(token)}")
+                logger.info(f"  前20字符: {token[:20]}...")
+                logger.info(f"  后10字符: ...{token[-10:]}")
                 return token
+
+            logger.error("在 x_ima_cookie 中未找到 IMA-TOKEN 或 IMA-REFRESH-TOKEN")
 
             # 如果在IMA_X_IMA_COOKIE中没找到，尝试从cookies中查找
             refresh_token_pattern = r"refresh_token=([^;]+)"
             if self.config.cookies:
+                logger.debug(f"尝试从 cookies 中解析 refresh_token")
+                logger.debug(f"  cookies 长度: {len(self.config.cookies)}")
                 match = re.search(refresh_token_pattern, self.config.cookies)
                 if match:
-                    logger.info(f"从cookies中解析refresh_token: {match.group(1)[:20]}...")
-                    return match.group(1)
+                    token = match.group(1)
+                    decoded_token = unquote(token)
+                    if decoded_token != token:
+                        logger.info(f"refresh_token 已进行 URL 解码")
+                        token = decoded_token
+                    
+                    logger.info(f"成功从 cookies 解析 refresh_token: {token[:20]}...")
+                    return token
+            
+            logger.warning("未能从任何来源解析到 refresh_token")
         except Exception as e:
-            logger.warning(f"解析IMA-TOKEN失败: {e}")
+            logger.error(f"解析 IMA-TOKEN 失败: {e}")
+            import traceback
+            logger.error(f"堆栈跟踪:\n{traceback.format_exc()}")
         return None
 
     async def refresh_token(self) -> bool:
         """刷新访问令牌"""
+        logger.info("=" * 60)
+        logger.info("开始刷新 Token")
+        
         if not self.config.user_id or not self.config.refresh_token:
             # 尝试从cookies中解析
+            logger.info("从 cookies 中解析 user_id 和 refresh_token")
             self.config.user_id = self._parse_user_id_from_cookies()
             self.config.refresh_token = self._parse_refresh_token_from_cookies()
 
             if not self.config.user_id or not self.config.refresh_token:
                 logger.warning("缺少token刷新所需的user_id或refresh_token")
+                logger.warning(f"  user_id 存在: {bool(self.config.user_id)}")
+                logger.warning(f"  refresh_token 存在: {bool(self.config.refresh_token)}")
                 return False
+
+        # 记录用于刷新的凭据信息（隐藏敏感部分）
+        logger.info(f"使用的凭据:")
+        logger.info(f"  user_id: {self.config.user_id}")
+        logger.info(f"  refresh_token 长度: {len(self.config.refresh_token)}")
+        logger.info(f"  refresh_token 前20字符: {self.config.refresh_token[:20]}...")
+        logger.info(f"  refresh_token 后10字符: ...{self.config.refresh_token[-10:]}")
 
         try:
             session = await self._get_session()
@@ -212,40 +270,90 @@ class IMAAPIClient:
             )
 
             refresh_url = f"{self.base_url}{self.refresh_endpoint}"
+            
+            # 构建请求头 - 添加 x-ima-bkn
+            refresh_headers = {
+                "accept": "*/*",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+                "content-type": "application/json",
+                "from_browser_ima": "1",
+                "x-ima-cookie": self.config.x_ima_cookie,
+                "x-ima-bkn": self.config.x_ima_bkn,
+                "referer": "https://ima.qq.com/wikis"
+            }
+
+            logger.info(f"刷新 Token URL: {refresh_url}")
+            logger.info(f"请求头（隐藏敏感信息）:")
+            for key, value in refresh_headers.items():
+                if key.lower() in ['x-ima-cookie']:
+                    logger.info(f"  {key}: [已隐藏，长度={len(str(value))}]")
+                else:
+                    logger.info(f"  {key}: {value}")
+            
+            request_body = refresh_request.dict()
+            logger.info(f"请求体:")
+            logger.info(f"  user_id: {request_body['user_id']}")
+            logger.info(f"  refresh_token 长度: {len(request_body['refresh_token'])}")
 
             async with session.post(
                 refresh_url,
-                json=refresh_request.dict(),
-                headers={
-                    "accept": "*/*",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-                    "content-type": "application/json",
-                    "from_browser_ima": "1",
-                    "x-ima-cookie": self.config.x_ima_cookie,
-                    "referer": "https://ima.qq.com/wikis"
-                }
+                json=request_body,
+                headers=refresh_headers
             ) as response:
+                logger.info(f"收到刷新响应，状态码: {response.status}")
+                # 获取响应内容
+                response_text = await response.text()
+                logger.info(f"响应内容（前500字符）: {response_text[:500]}")
+                
                 if response.status == 200:
-                    response_data = await response.json()
-                    refresh_response = TokenRefreshResponse(**response_data)
+                    try:
+                        response_data = await response.json()
+                        logger.info(f"解析后的响应数据: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
+                        refresh_response = TokenRefreshResponse(**response_data)
 
-                    if refresh_response.code == 0 and refresh_response.token:
-                        # 更新token信息
-                        self.config.current_token = refresh_response.token
-                        self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
-                        self.config.token_updated_at = datetime.now()
+                        if refresh_response.code == 0 and refresh_response.token:
+                            # 更新token信息
+                            self.config.current_token = refresh_response.token
+                            self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
+                            self.config.token_updated_at = datetime.now()
 
-                        logger.info("Token刷新成功")
-                        return True
-                    else:
-                        logger.warning(f"Token刷新失败: {refresh_response.msg}")
+                            logger.info("=" * 60)
+                            logger.info("Token刷新成功!")
+                            logger.info(f"  新 token 长度: {len(self.config.current_token)}")
+                            logger.info(f"  有效期: {self.config.token_valid_time} 秒")
+                            logger.info("=" * 60)
+                            return True
+                        else:
+                            logger.warning("=" * 60)
+                            logger.warning(f"Token刷新失败")
+                            logger.warning(f"  响应代码: {refresh_response.code}")
+                            logger.warning(f"  错误信息: {refresh_response.msg}")
+                            # 尝试从原始响应数据中获取更多错误信息
+                            if 'type' in response_data:
+                                logger.warning(f"  响应类型: {response_data['type']}")
+                            if 'caused_by' in response_data:
+                                logger.warning(f"  引起原因: {response_data['caused_by']}")
+                            logger.warning("=" * 60)
+                            return False
+                    except json.JSONDecodeError as je:
+                        logger.error(f"无法解析响应为 JSON: {je}")
+                        logger.error(f"原始响应: {response_text}")
                         return False
                 else:
-                    logger.error(f"Token刷新请求失败，状态码: {response.status}")
+                    logger.error("=" * 60)
+                    logger.error(f"Token刷新请求失败")
+                    logger.error(f"  状态码: {response.status}")
+                    logger.error(f"  响应内容: {response_text}")
+                    logger.error("=" * 60)
                     return False
 
         except Exception as e:
+            logger.error("=" * 60)
             logger.error(f"Token刷新异常: {e}")
+            logger.error(f"异常类型: {type(e).__name__}")
+            import traceback
+            logger.error(f"堆栈跟踪:\n{traceback.format_exc()}")
+            logger.error("=" * 60)
             return False
 
     async def ensure_valid_token(self) -> bool:
@@ -281,8 +389,25 @@ class IMAAPIClient:
 
     def _build_headers(self, for_init_session: bool = False) -> Dict[str, str]:
         """构建请求头"""
+        # 如果刷新了 token，需要更新 x-ima-cookie 中的 IMA-TOKEN
+        x_ima_cookie = self.config.x_ima_cookie
+        if self.config.current_token:
+            # 替换 x-ima-cookie 中的旧 IMA-TOKEN
+            import re
+            # 先尝试替换现有的 IMA-TOKEN
+            new_cookie = re.sub(
+                r'IMA-TOKEN=[^;]+',
+                f'IMA-TOKEN={self.config.current_token}',
+                x_ima_cookie
+            )
+            # 如果没有找到 IMA-TOKEN，则添加它
+            if new_cookie == x_ima_cookie and 'IMA-TOKEN=' not in x_ima_cookie:
+                new_cookie = x_ima_cookie + f'; IMA-TOKEN={self.config.current_token}'
+            x_ima_cookie = new_cookie
+            logger.debug(f"已更新 x-ima-cookie 中的 IMA-TOKEN")
+        
         headers = {
-            "x-ima-cookie": self.config.x_ima_cookie,
+            "x-ima-cookie": x_ima_cookie,
             "from_browser_ima": "1",
             "extension_version": "999.999.999",
             "x-ima-bkn": self.config.x_ima_bkn,
@@ -307,7 +432,7 @@ class IMAAPIClient:
 
         # 记录关键请求头（隐藏敏感信息）
         logger.debug(f"构建请求头 - for_init_session={for_init_session}")
-        logger.debug(f"  x-ima-cookie 长度: {len(self.config.x_ima_cookie)}")
+        logger.debug(f"  x-ima-cookie 长度: {len(x_ima_cookie)}")
         logger.debug(f"  x-ima-bkn: {self.config.x_ima_bkn}")
         logger.debug(f"  cookies 长度: {len(self.config.cookies or '')}")
         
@@ -871,16 +996,15 @@ class IMAAPIClient:
             logger.error("无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
 
-        # 如果会话未初始化，先初始化会话
-        if not self.session_initialized or not self.current_session_id:
-            logger.info("会话未初始化，开始初始化...")
-            try:
-                await self.init_session()
-                logger.info(f"会话初始化成功，session_id: {self.current_session_id}")
-            except Exception as init_error:
-                logger.error(f"会话初始化失败: {init_error}")
-                logger.error("这可能是导致 'No valid session ID provided' 错误的原因")
-                raise
+        # 每次调用都初始化新会话，实现上下文隔离
+        logger.info("初始化新会话以实现上下文隔离...")
+        try:
+            await self.init_session()
+            logger.info(f"会话初始化成功，session_id: {self.current_session_id}")
+        except Exception as init_error:
+            logger.error(f"会话初始化失败: {init_error}")
+            logger.error("这可能是导致 'No valid session ID provided' 错误的原因")
+            raise
 
         session = await self._get_session()
         request_data = self._build_request(question)

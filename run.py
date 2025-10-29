@@ -29,7 +29,7 @@ def setup_debug_logging():
     
     # 配置根日志记录器
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
     
     # 移除现有的处理器
     for handler in root_logger.handlers[:]:
@@ -64,7 +64,7 @@ def setup_debug_logging():
     
     # 配置ima_client日志记录器
     ima_logger = logging.getLogger('ima_client')
-    ima_logger.setLevel(logging.DEBUG)
+    ima_logger.setLevel(logging.INFO)
     
     print(f"✅ 调试日志已启用，日志文件: {log_file}")
     return log_file
