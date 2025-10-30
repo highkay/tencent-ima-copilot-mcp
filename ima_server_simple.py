@@ -58,9 +58,7 @@ async def ensure_client_ready():
     global ima_client, _token_refreshed
     
     if not ima_client:
-        logger.info("=" * 80)
-        logger.info("🚀 [启动优化] 首次请求，开始初始化 IMA 客户端...")
-        logger.info("=" * 80)
+        logger.info("🚀 首次请求，初始化 IMA 客户端...")
         
         config = get_config()
         if not config:
@@ -74,14 +72,14 @@ async def ensure_client_ready():
             config.raw_log_on_success = False
             
             ima_client = IMAAPIClient(config)
-            logger.info("✅ IMA 客户端初始化成功")
+            logger.debug("✅ IMA 客户端初始化成功")
         except Exception as e:
             logger.error(f"❌ IMA 客户端初始化失败: {e}")
             return False
     
     # 如果还没刷新过 token，提前刷新一次（添加超时保护）
     if not _token_refreshed:
-        logger.info("🔄 [启动优化] 提前验证并刷新 token...")
+        logger.info("🔄 验证 token...")
         try:
             import asyncio
             # 为token刷新也添加超时保护（10秒应该足够）
@@ -92,17 +90,16 @@ async def ensure_client_ready():
             
             if token_valid:
                 _token_refreshed = True
-                logger.info("✅ [启动优化] Token 验证成功，后续请求将直接使用有效 token")
-                logger.info("=" * 80)
+                logger.info("✅ Token 验证成功")
                 return True
             else:
-                logger.warning("⚠️ [启动优化] Token 验证失败")
+                logger.warning("⚠️ Token 验证失败")
                 return False
         except asyncio.TimeoutError:
-            logger.error("❌ [启动优化] Token 验证超时（超过10秒）")
+            logger.error("❌ Token 验证超时")
             return False
         except Exception as e:
-            logger.error(f"❌ [启动优化] Token 验证异常: {e}")
+            logger.error(f"❌ Token 验证异常: {e}")
             return False
     
     return True
@@ -124,24 +121,16 @@ async def ask(question: str) -> str:
     if not await ensure_client_ready():
         return "[ERROR] IMA 客户端初始化或 token 刷新失败，请检查配置"
 
-    logger.info("=" * 80)
-    logger.info(f"🔍 [诊断] ask 工具被调用")
-    logger.info(f"  问题: {question[:100]}...")
-    logger.info(f"  ima_client 状态: 已就绪")
-    logger.info(f"  当前 session_id: {ima_client.current_session_id if ima_client.current_session_id else '未初始化'}")
-    logger.info("=" * 80)
+    logger.debug(f"🔍 ask 工具: {question[:50]}...")
 
     if not question or not question.strip():
         return "[ERROR] 问题不能为空"
 
     try:
-        logger.info(f"发送问题到 IMA: {question}")
+        logger.debug(f"发送问题: {question[:50]}...")
 
-        # 🔧 添加超时保护 - MCP默认超时是60秒，我们设置55秒以确保在MCP超时前返回
         import asyncio
-        mcp_safe_timeout = 55  # 留5秒缓冲给MCP
-        
-        logger.info(f"⏱️  设置超时保护: {mcp_safe_timeout} 秒")
+        mcp_safe_timeout = 55
         
         try:
             # 使用 asyncio.wait_for 添加超时控制
@@ -152,12 +141,11 @@ async def ask(question: str) -> str:
             
             # 即使没有消息，也会返回包含错误信息的消息列表
             if not messages:
-                logger.warning("⚠️  没有收到任何响应消息")
+                logger.warning("⚠️ 未收到响应")
                 return "[ERROR] 没有收到任何响应"
 
             response = ima_client._extract_text_content(messages)
-
-            logger.info(f"✅ 从 IMA 获取到响应，长度: {len(response)}")
+            logger.debug(f"✅ 获取响应 (长度: {len(response)})")
             return response
             
         except asyncio.TimeoutError:

@@ -2,13 +2,18 @@
 IMA API 客户端实现
 """
 import asyncio
+import base64
 import json
 import logging
+import random
 import re
+import secrets
+import string
+import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional
 from urllib.parse import unquote
 
 import aiohttp
@@ -16,7 +21,6 @@ import aiohttp
 from models import (
     IMAConfig,
     IMARequest,
-    IMAResponse,
     IMAMessage,
     MessageType,
     KnowledgeBaseMessage,
@@ -140,125 +144,71 @@ class IMAAPIClient:
         """检查token是否过期"""
         if not self.config.token_updated_at or not self.config.token_valid_time:
             return True
-
-        from datetime import timedelta
+        
         expired_time = self.config.token_updated_at + timedelta(seconds=self.config.token_valid_time)
         return datetime.now() > expired_time
 
     def _parse_user_id_from_cookies(self) -> Optional[str]:
         """从IMA_X_IMA_COOKIE中解析IMA-UID"""
         try:
-            # 从IMA_X_IMA_COOKIE中提取IMA-UID
-            import re
             uid_pattern = r"IMA-UID=([^;]+)"
             match = re.search(uid_pattern, self.config.x_ima_cookie)
             if match:
-                uid = match.group(1)
-                logger.debug(f"成功解析IMA-UID: {uid}")
-                return uid
+                return match.group(1)
 
-            # 如果在IMA_X_IMA_COOKIE中没找到，尝试从cookies中查找
             user_id_pattern = r"user_id=([a-f0-9]{16})"
             if self.config.cookies:
                 match = re.search(user_id_pattern, self.config.cookies)
                 if match:
-                    logger.info(f"从cookies中解析user_id: {match.group(1)}")
                     return match.group(1)
         except Exception as e:
             logger.warning(f"解析user_id失败: {e}")
         return None
 
     def _parse_refresh_token_from_cookies(self) -> Optional[str]:
-        """从IMA_X_IMA_COOKIE中解析IMA-REFRESH-TOKEN（用于刷新token）"""
+        """从IMA_X_IMA_COOKIE中解析IMA-REFRESH-TOKEN"""
         try:
-            import re
-            
-            logger.debug(f"开始解析 refresh_token")
-            logger.debug(f"  x_ima_cookie 长度: {len(self.config.x_ima_cookie)}")
-            logger.debug(f"  x_ima_cookie 前100字符: {self.config.x_ima_cookie[:100]}...")
-            
-            # 优先尝试解析 IMA-REFRESH-TOKEN（这是正确的刷新令牌）
             refresh_token_pattern = r"IMA-REFRESH-TOKEN=([^;]+)"
             match = re.search(refresh_token_pattern, self.config.x_ima_cookie)
             if match:
-                token = match.group(1)
-                decoded_token = unquote(token)
-                if decoded_token != token:
-                    logger.info(f"IMA-REFRESH-TOKEN 已进行 URL 解码")
-                    logger.info(f"  原始长度: {len(token)}, 解码后长度: {len(decoded_token)}")
-                    token = decoded_token
-                
-                logger.info(f"✓ 成功从 x_ima_cookie 解析 IMA-REFRESH-TOKEN")
-                logger.info(f"  长度: {len(token)}")
-                logger.info(f"  前20字符: {token[:20]}...")
-                logger.info(f"  后10字符: ...{token[-10:]}")
+                token = unquote(match.group(1))
+                logger.info(f"成功从 x_ima_cookie 解析 IMA-REFRESH-TOKEN (长度: {len(token)})")
                 return token
             
             logger.warning("在 x_ima_cookie 中未找到 IMA-REFRESH-TOKEN")
             
-            # 如果找不到 IMA-REFRESH-TOKEN，尝试回退到 IMA-TOKEN
             token_pattern = r"IMA-TOKEN=([^;]+)"
             match = re.search(token_pattern, self.config.x_ima_cookie)
             if match:
-                token = match.group(1)
-                decoded_token = unquote(token)
-                if decoded_token != token:
-                    token = decoded_token
-                
-                logger.warning(f"⚠ 使用 IMA-TOKEN 作为 refresh_token（应该使用 IMA-REFRESH-TOKEN）")
-                logger.info(f"  长度: {len(token)}")
-                logger.info(f"  前20字符: {token[:20]}...")
-                logger.info(f"  后10字符: ...{token[-10:]}")
+                token = unquote(match.group(1))
+                logger.warning(f"使用 IMA-TOKEN 作为 refresh_token（长度: {len(token)}）")
                 return token
 
-            logger.error("在 x_ima_cookie 中未找到 IMA-TOKEN 或 IMA-REFRESH-TOKEN")
-
-            # 如果在IMA_X_IMA_COOKIE中没找到，尝试从cookies中查找
-            refresh_token_pattern = r"refresh_token=([^;]+)"
             if self.config.cookies:
-                logger.debug(f"尝试从 cookies 中解析 refresh_token")
-                logger.debug(f"  cookies 长度: {len(self.config.cookies)}")
+                refresh_token_pattern = r"refresh_token=([^;]+)"
                 match = re.search(refresh_token_pattern, self.config.cookies)
                 if match:
-                    token = match.group(1)
-                    decoded_token = unquote(token)
-                    if decoded_token != token:
-                        logger.info(f"refresh_token 已进行 URL 解码")
-                        token = decoded_token
-                    
-                    logger.info(f"成功从 cookies 解析 refresh_token: {token[:20]}...")
+                    token = unquote(match.group(1))
+                    logger.info(f"成功从 cookies 解析 refresh_token")
                     return token
             
             logger.warning("未能从任何来源解析到 refresh_token")
         except Exception as e:
-            logger.error(f"解析 IMA-TOKEN 失败: {e}")
-            import traceback
-            logger.error(f"堆栈跟踪:\n{traceback.format_exc()}")
+            logger.error(f"解析 refresh_token 失败: {e}\n{traceback.format_exc()}")
         return None
 
     async def refresh_token(self) -> bool:
         """刷新访问令牌"""
-        logger.info("=" * 60)
-        logger.info("开始刷新 Token")
+        logger.info("🔄 开始刷新 Token")
         
         if not self.config.user_id or not self.config.refresh_token:
-            # 尝试从cookies中解析
             logger.info("从 cookies 中解析 user_id 和 refresh_token")
             self.config.user_id = self._parse_user_id_from_cookies()
             self.config.refresh_token = self._parse_refresh_token_from_cookies()
 
             if not self.config.user_id or not self.config.refresh_token:
                 logger.warning("缺少token刷新所需的user_id或refresh_token")
-                logger.warning(f"  user_id 存在: {bool(self.config.user_id)}")
-                logger.warning(f"  refresh_token 存在: {bool(self.config.refresh_token)}")
                 return False
-
-        # 记录用于刷新的凭据信息（隐藏敏感部分）
-        logger.info(f"使用的凭据:")
-        logger.info(f"  user_id: {self.config.user_id}")
-        logger.info(f"  refresh_token 长度: {len(self.config.refresh_token)}")
-        logger.info(f"  refresh_token 前20字符: {self.config.refresh_token[:20]}...")
-        logger.info(f"  refresh_token 后10字符: ...{self.config.refresh_token[-10:]}")
 
         try:
             session = await self._get_session()
@@ -281,34 +231,18 @@ class IMAAPIClient:
                 "x-ima-bkn": self.config.x_ima_bkn,
                 "referer": "https://ima.qq.com/wikis"
             }
-
-            logger.info(f"刷新 Token URL: {refresh_url}")
-            logger.info(f"请求头（隐藏敏感信息）:")
-            for key, value in refresh_headers.items():
-                if key.lower() in ['x-ima-cookie']:
-                    logger.info(f"  {key}: [已隐藏，长度={len(str(value))}]")
-                else:
-                    logger.info(f"  {key}: {value}")
             
             request_body = refresh_request.model_dump()
-            logger.info(f"请求体:")
-            logger.info(f"  user_id: {request_body['user_id']}")
-            logger.info(f"  refresh_token 长度: {len(request_body['refresh_token'])}")
 
             async with session.post(
                 refresh_url,
                 json=request_body,
                 headers=refresh_headers
             ) as response:
-                logger.info(f"收到刷新响应，状态码: {response.status}")
-                # 获取响应内容
                 response_text = await response.text()
-                logger.info(f"响应内容（前500字符）: {response_text[:500]}")
-                
                 if response.status == 200:
                     try:
                         response_data = await response.json()
-                        logger.info(f"解析后的响应数据: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
                         refresh_response = TokenRefreshResponse(**response_data)
 
                         if refresh_response.code == 0 and refresh_response.token:
@@ -317,11 +251,7 @@ class IMAAPIClient:
                             self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
                             self.config.token_updated_at = datetime.now()
 
-                            logger.info("=" * 60)
-                            logger.info("Token刷新成功!")
-                            logger.info(f"  新 token 长度: {len(self.config.current_token)}")
-                            logger.info(f"  有效期: {self.config.token_valid_time} 秒")
-                            logger.info("=" * 60)
+                            logger.info(f"✅ Token刷新成功 (有效期: {self.config.token_valid_time}秒)")
                             return True
                         else:
                             logger.warning("=" * 60)
@@ -337,39 +267,38 @@ class IMAAPIClient:
                             return False
                     except json.JSONDecodeError as je:
                         logger.error(f"无法解析响应为 JSON: {je}")
-                        logger.error(f"原始响应: {response_text}")
+                        logger.error(f"原始响应: {response_text[:200]}")
                         return False
                 else:
                     logger.error("=" * 60)
                     logger.error(f"Token刷新请求失败")
                     logger.error(f"  状态码: {response.status}")
-                    logger.error(f"  响应内容: {response_text}")
+                    logger.error(f"  响应内容: {response_text[:200]}")
                     logger.error("=" * 60)
                     return False
 
         except Exception as e:
-            logger.error("=" * 60)
-            logger.error(f"Token刷新异常: {e}")
-            logger.error(f"异常类型: {type(e).__name__}")
-            import traceback
-            logger.error(f"堆栈跟踪:\n{traceback.format_exc()}")
-            logger.error("=" * 60)
+            logger.error(f"Token刷新异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return False
 
     async def ensure_valid_token(self) -> bool:
         """确保token有效，如果过期则刷新"""
-        # 如果没有current_token，或者token过期，尝试刷新
         if self._is_token_expired():
-            # 如果有refresh_token和user_id，尝试刷新token
             if self.config.refresh_token and self.config.user_id:
                 logger.info("Token已过期，尝试刷新...")
                 return await self.refresh_token()
             else:
-                # 如果没有refresh_token，说明使用基于cookies的认证，不需要token
-                logger.info("使用基于cookies的认证，无需token刷新")
-                return True
+                logger.info("尝试从cookies中解析refresh_token并主动刷新...")
+                self.config.user_id = self._parse_user_id_from_cookies()
+                self.config.refresh_token = self._parse_refresh_token_from_cookies()
+                
+                if self.config.refresh_token and self.config.user_id:
+                    logger.info("成功从cookies中解析凭据，开始刷新token...")
+                    return await self.refresh_token()
+                else:
+                    logger.warning("无法从cookies中解析refresh_token，将使用原始cookies")
+                    return True
 
-        # Token仍然有效
         return True
 
     
@@ -389,22 +318,17 @@ class IMAAPIClient:
 
     def _build_headers(self, for_init_session: bool = False) -> Dict[str, str]:
         """构建请求头"""
-        # 如果刷新了 token，需要更新 x-ima-cookie 中的 IMA-TOKEN
         x_ima_cookie = self.config.x_ima_cookie
+        
         if self.config.current_token:
-            # 替换 x-ima-cookie 中的旧 IMA-TOKEN
-            import re
-            # 先尝试替换现有的 IMA-TOKEN
-            new_cookie = re.sub(
+            x_ima_cookie = re.sub(
                 r'IMA-TOKEN=[^;]+',
                 f'IMA-TOKEN={self.config.current_token}',
                 x_ima_cookie
             )
-            # 如果没有找到 IMA-TOKEN，则添加它
-            if new_cookie == x_ima_cookie and 'IMA-TOKEN=' not in x_ima_cookie:
-                new_cookie = x_ima_cookie + f'; IMA-TOKEN={self.config.current_token}'
-            x_ima_cookie = new_cookie
-            logger.debug(f"已更新 x-ima-cookie 中的 IMA-TOKEN")
+            
+            if 'IMA-TOKEN=' not in x_ima_cookie:
+                x_ima_cookie = x_ima_cookie + f'; IMA-TOKEN={self.config.current_token}'
         
         headers = {
             "x-ima-cookie": x_ima_cookie,
@@ -412,7 +336,7 @@ class IMAAPIClient:
             "extension_version": "999.999.999",
             "x-ima-bkn": self.config.x_ima_bkn,
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-            "accept": "application/json" if for_init_session else "text/event-stream",  # init_session期望JSON，qa期望SSE
+            "accept": "application/json" if for_init_session else "text/event-stream",
             "content-type": "application/json",
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
             "sec-ch-ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
@@ -423,18 +347,8 @@ class IMAAPIClient:
             "sec-fetch-site": "same-origin",
         }
 
-        # 如果有当前token，添加到请求头
         if self.config.current_token:
             headers["authorization"] = f"Bearer {self.config.current_token}"
-            logger.debug(f"已添加 authorization 请求头 (token前20字符): {self.config.current_token[:20]}...")
-        else:
-            logger.debug("未添加 authorization 请求头 (无current_token)")
-
-        # 记录关键请求头（隐藏敏感信息）
-        logger.debug(f"构建请求头 - for_init_session={for_init_session}")
-        logger.debug(f"  x-ima-cookie 长度: {len(x_ima_cookie)}")
-        logger.debug(f"  x-ima-bkn: {self.config.x_ima_bkn}")
-        logger.debug(f"  cookies 长度: {len(self.config.cookies or '')}")
         
         return headers
 
@@ -446,24 +360,16 @@ class IMAAPIClient:
                 limit_per_host=30,
                 ttl_dns_cache=300,
                 use_dns_cache=True,
-                # 启用连接池和keep-alive
                 keepalive_timeout=60,
                 enable_cleanup_closed=True,
             )
 
-            # 增加超时时间以处理大响应
-            # 对于SSE流，需要更长的读取时间
             timeout = aiohttp.ClientTimeout(
-                total=min(self.config.timeout, 120),  # 总超时最多2分钟
-                sock_read=90,   # socket 读取超时增加到90秒
-                connect=30,     # 连接超时
-                sock_connect=30, # socket连接超时
+                total=min(self.config.timeout, 300),
+                sock_read=180,
+                connect=30,
+                sock_connect=30,
             )
-
-            # 配置代理（如果设置）
-            proxy = None
-            if self.config.proxy:
-                proxy = self.config.proxy
 
             self.session = aiohttp.ClientSession(
                 connector=connector,
@@ -471,9 +377,7 @@ class IMAAPIClient:
                 cookies=self._parse_cookies(self.config.cookies or ""),
                 headers=self._build_headers(for_init_session),
                 trust_env=True,
-                # 增加读取缓冲区大小
-                read_bufsize=2**20,  # 1MB
-                # 启用自动解压缩
+                read_bufsize=5 * 2**20,
                 auto_decompress=True,
             )
 
@@ -486,31 +390,17 @@ class IMAAPIClient:
 
     def _generate_session_id(self) -> str:
         """生成会话 ID"""
-        import random
-        import string
         return ''.join(random.choices(string.ascii_lowercase + string.digits, k=24))
 
     def _generate_temp_uskey(self) -> str:
         """生成临时 uskey"""
-        import base64
-        import secrets
-
-        # 生成 32 字节的随机数据
-        random_bytes = secrets.token_bytes(32)
-        # 编码为 Base64 字符串
-        return base64.b64encode(random_bytes).decode('utf-8')
+        return base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
 
     def _build_request(self, question: str) -> IMARequest:
         """构建 IMA API 请求"""
-        # 使用 init_session 获取的 session_id，如果没有则生成一个
         session_id = self.current_session_id or self._generate_session_id()
+        uskey = self._generate_temp_uskey()
 
-        # 如果没有提供 uskey，尝试生成一个临时的
-        uskey = self.config.uskey
-        if not uskey:
-            uskey = self._generate_temp_uskey()
-
-        # 提取 IMA-GUID
         try:
             ima_guid = self.config.x_ima_cookie.split('IMA-GUID=')[1].split(';')[0]
         except (IndexError, AttributeError):
@@ -545,27 +435,21 @@ class IMAAPIClient:
     def _parse_sse_message(self, line: str) -> Optional[IMAMessage]:
         """解析 SSE 消息"""
         try:
-            # 优化日志：移除逐行解析的DEBUG日志，减少日志量
             if line.startswith('data: '):
                 data = line[6:]
             elif line.startswith(('event: ', 'id: ')):
-                return None  # 跳过SSE控制消息
+                return None
             else:
                 data = line
 
             if not data or data == '[DONE]' or not data.strip():
-                return None  # 跳过空行或结束标记
+                return None
 
-            # 解析 JSON 数据
             json_data = json.loads(data)
 
-            # 处理不同的消息格式
-            # 格式1: 包含消息列表的响应
             if 'msgs' in json_data and isinstance(json_data['msgs'], list):
-                # 这是最终响应，包含多个消息
-                for i, msg in enumerate(json_data['msgs']):
+                for msg in json_data['msgs']:
                     if isinstance(msg, dict) and 'content' in msg:
-                        # 提取内容
                         content = msg.get('content', '')
                         if content:
                             return TextMessage(
@@ -576,7 +460,6 @@ class IMAAPIClient:
                             )
                 return None
 
-            # 格式2: 直接包含内容字段
             if 'content' in json_data:
                 content = json_data['content']
                 if isinstance(content, str) and content:
@@ -587,7 +470,6 @@ class IMAAPIClient:
                         raw=data
                     )
 
-            # 格式3: 包含 Text 字段
             if 'Text' in json_data and isinstance(json_data['Text'], str):
                 return TextMessage(
                     type=MessageType.TEXT,
@@ -596,16 +478,12 @@ class IMAAPIClient:
                     raw=data
                 )
 
-            # 格式4: 知识库消息
             if 'type' in json_data and json_data['type'] == 'knowledgeBase':
-                # 确保content字段存在
                 if 'content' not in json_data:
                     json_data['content'] = json_data.get('processing', '知识库搜索中...')
                 return KnowledgeBaseMessage(**json_data)
 
-            # 格式5: 其他格式的消息，尝试提取有用信息
             if 'question' in json_data and 'answer' in json_data:
-                # 问答格式
                 answer = json_data.get('answer', '')
                 if answer:
                     return TextMessage(
@@ -615,16 +493,14 @@ class IMAAPIClient:
                         raw=data
                     )
 
-            # 如果都无法匹配，将整个JSON作为内容
             return IMAMessage(
                 type=MessageType.SYSTEM,
                 content=str(json_data),
                 raw=data
             )
 
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.debug(f"Failed to parse SSE message: {e}, line: {line[:100]}...")
-            raise  # Re-raise the exception to be caught upstream
+        except (json.JSONDecodeError, KeyError, ValueError):
+            raise
 
     async def _process_sse_stream(
         self,
@@ -634,51 +510,36 @@ class IMAAPIClient:
         attempt_index: int,
         question: Optional[str],
     ) -> AsyncGenerator[IMAMessage, None]:
-        """处理 SSE 流 - 完整处理所有消息"""
+        """处理 SSE 流"""
         buffer = ""
         full_response = ""
         message_count = 0
-        parsed_message_count = 0  # 成功解析的消息数
-        failed_parse_count = 0  # 解析失败的chunk数
-        no_data_timeout = 120  # 增加到120秒无数据超时,与total timeout一致
-        chunk_timeout = 60  # 增加到60秒以处理慢速响应
+        parsed_message_count = 0
+        failed_parse_count = 0
+        initial_timeout = 180
+        chunk_timeout = 120
         last_data_time = asyncio.get_event_loop().time()
         start_time = asyncio.get_event_loop().time()
-        has_received_data = False  # 标记是否收到过数据
-        first_chunk_logged = False  # 是否已记录第一个chunk
-        sample_chunks = []  # 保存前10个chunk样本用于分析
-
+        has_received_data = False
+        sample_chunks = []
         stream_error: Optional[str] = None
-        raw_log_path: Optional[Path] = None
-
-        # 记录开始处理SSE流
-        logger.debug(f"开始处理SSE流 (trace_id={trace_id}, attempt={attempt_index + 1})")
 
         try:
+            logger.debug(f"🔄 [SSE流] 开始读取 (trace_id={trace_id})")
             async for chunk in response.content:
                 current_time = asyncio.get_event_loop().time()
 
-                # 动态超时检查:如果已经收到数据,使用较短的chunk超时;否则使用完整超时
-                timeout_threshold = chunk_timeout if has_received_data else no_data_timeout
-                if current_time - last_data_time > timeout_threshold:
-                    logger.warning(f"SSE 流读取超时，无数据时间超过{timeout_threshold}秒 (已处理{message_count}条消息)")
-                    logger.debug(f"超时时的状态 - buffer长度: {len(buffer)}, 已处理数据: {len(full_response)}字节")
-                    logger.debug(f"超时时的统计 - 成功解析: {parsed_message_count}, 失败解析: {failed_parse_count}")
-                    # 不是立即中断,而是尝试解析已接收的数据
+                timeout_threshold = chunk_timeout if has_received_data else initial_timeout
+                elapsed_since_last_data = current_time - last_data_time
+                
+                if elapsed_since_last_data > timeout_threshold:
+                    stream_error = f"Timeout after {elapsed_since_last_data:.1f}s with {message_count} chunks"
                     break
 
                 if chunk:
                     has_received_data = True
                     last_data_time = current_time
                     message_count += 1
-
-                    # 保存前10个chunk样本
-                    if len(sample_chunks) < 10:
-                        sample_chunks.append({
-                            'chunk_num': message_count,
-                            'size': len(chunk),
-                            'content_preview': chunk.decode('utf-8', errors='ignore')[:100]
-                        })
 
                     try:
                         chunk_str = chunk.decode('utf-8')
@@ -689,20 +550,14 @@ class IMAAPIClient:
                         except UnicodeDecodeError:
                             # 如果都失败，使用错误处理模式
                             chunk_str = chunk.decode('utf-8', errors='ignore')
-                            logger.warning(f"Chunk {message_count} 解码失败，使用ignore模式")
-
-                    first_chunk_logged = True
+                            logger.warning(f"Chunk {message_count} 解码失败")
 
                     buffer += chunk_str
                     full_response += chunk_str
 
-                    # 处理完整的行
-                    lines_in_chunk = 0
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         line = line.strip()
-                        lines_in_chunk += 1
-
                         if line:
                             try:
                                 message = self._parse_sse_message(line)
@@ -713,25 +568,25 @@ class IMAAPIClient:
                                 failed_parse_count += 1
 
 
-        except asyncio.TimeoutError as exc:
-            stream_error = f"SSE timeout: {exc}"
-            logger.error("SSE 流读取超时")
-            raise
+        except asyncio.TimeoutError:
+            if has_received_data and parsed_message_count > 0:
+                stream_error = None
+            else:
+                stream_error = "SSE timeout"
+                logger.error(f"❌ [SSE流] 超时错误（未收到数据）, trace_id={trace_id}")
         except aiohttp.ClientPayloadError as exc:
             stream_error = f"SSE payload error: {exc}"
-            logger.error(f"SSE 流数据错误: {exc}")
-            raise
+            logger.error(f"❌ [SSE流] ClientPayloadError: {exc}, trace_id={trace_id}")
         except Exception as exc:
             stream_error = f"SSE exception: {exc}"
-            logger.error(f"SSE 流处理异常: {exc}")
-            raise
+            logger.error(f"❌ [SSE流] 未知异常: {type(exc).__name__}: {exc}, trace_id={trace_id}\n{traceback.format_exc()}")
         finally:
             # 确保响应被正确关闭
             if not response.closed:
                 response.close()
 
             elapsed_time = asyncio.get_event_loop().time() - start_time
-            raw_log_path = self._persist_raw_response(
+            self._persist_raw_response(
                 trace_id=trace_id,
                 attempt_index=attempt_index,
                 question=question,
@@ -757,20 +612,15 @@ class IMAAPIClient:
                     except (json.JSONDecodeError, KeyError, ValueError):
                         failed_parse_count += 1
 
-        # 如果没有从 SSE 流中解析到足够消息，尝试将整个响应作为 JSON 处理
-        # 这是为了处理 IMA 可能返回的完整 JSON 响应
-        if message_count < 100 or not has_received_data:  # 消息较少或没收到数据时尝试完整解析
-            # 尝试解析整个响应为 JSON
+        if message_count < 100 or not has_received_data:
             try:
                 if full_response.strip():
                     response_data = json.loads(full_response.strip())
-                    # 尝试从响应中提取有用信息
                     messages = self._extract_messages_from_response(response_data)
                     for message in messages:
                         yield message
 
-            except json.JSONDecodeError as e:
-                # 最后尝试：逐行解析响应
+            except json.JSONDecodeError:
                 if full_response:
                     lines = full_response.split('\n')
                     for i, line in enumerate(lines):
@@ -783,42 +633,36 @@ class IMAAPIClient:
                             else:
                                 failed_parse_count += 1
 
-        # 记录最终处理统计
         elapsed_time = asyncio.get_event_loop().time() - start_time
-        parse_rate = (parsed_message_count / message_count * 100) if message_count > 0 else 0
-        extra_info = f"，原始日志: {raw_log_path}" if raw_log_path else ""
-        logger.info(f"SSE 流处理结束: 收到 {message_count} 个数据块, "
-                   f"成功解析 {parsed_message_count} 条消息, "
-                   f"失败 {failed_parse_count} 次, "
-                   f"响应大小 {len(full_response)} 字节, 耗时 {elapsed_time:.1f} 秒{extra_info}")
+        
+        logger.info("=" * 80)
+        logger.info(f"✅ [SSE流] 处理完成 (trace_id={trace_id})")
+        logger.info(f"  收到数据块: {message_count} 个, 成功解析: {parsed_message_count} 条, 失败: {failed_parse_count} 次")
+        logger.info(f"  响应大小: {len(full_response)} 字节, 耗时: {elapsed_time:.1f} 秒")
+        if stream_error:
+            logger.info(f"  流错误: {stream_error}")
+        logger.info("=" * 80)
 
-        # 诊断性日志
-        # 诊断性日志 - 仅在出现严重解析问题时记录
         if message_count > 100 and parsed_message_count < 5:
             logger.error(f"严重: 收到 {message_count} 个chunk但只解析出 {parsed_message_count} 条消息，"
                         f"解析率 {(parsed_message_count/message_count*100):.1f}%")
             logger.debug(f"前10个chunk样本: {sample_chunks}")
 
     def _extract_messages_from_response(self, response_data: Dict[str, Any]) -> List[IMAMessage]:
-        """从完整响应中提取消息 - 只关注qa返回的msgs中最后一个对象"""
+        """从完整响应中提取消息"""
         messages = []
 
         try:
-            # 查找qa响应中的msgs列表
             if 'msgs' in response_data and isinstance(response_data['msgs'], list):
                 msgs_list = response_data['msgs']
                 if msgs_list:
-                    # 获取最后一个消息对象
                     last_msg = msgs_list[-1]
                     if isinstance(last_msg, dict):
-                        # 检查是否是qa消息类型 (type: 3)
                         if last_msg.get('type') == 3:
                             qa_content = last_msg.get('content', {})
                             if isinstance(qa_content, dict):
-                                # 提取answer内容
                                 answer = qa_content.get('answer', '')
                                 if isinstance(answer, str) and answer:
-                                    # 解析answer中的JSON（通常是转义的）
                                     try:
                                         answer_data = json.loads(answer)
                                         if isinstance(answer_data, dict) and 'Text' in answer_data:
@@ -830,7 +674,6 @@ class IMAAPIClient:
                                                 raw=str(last_msg)
                                             ))
                                         else:
-                                            # 如果不是预期的格式，直接使用answer内容
                                             messages.append(TextMessage(
                                                 type=MessageType.TEXT,
                                                 content=answer,
@@ -838,7 +681,6 @@ class IMAAPIClient:
                                                 raw=str(last_msg)
                                             ))
                                     except json.JSONDecodeError:
-                                        # 如果无法解析JSON，直接使用answer内容
                                         messages.append(TextMessage(
                                             type=MessageType.TEXT,
                                             content=answer,
@@ -846,17 +688,14 @@ class IMAAPIClient:
                                             raw=str(last_msg)
                                         ))
 
-                                # 提取context_refs内容
                                 context_refs = qa_content.get('context_refs', '')
                                 if context_refs:
-                                    # 解析context_refs（通常是JSON格式的参考资料）
                                     try:
                                         context_data = json.loads(context_refs)
                                         if isinstance(context_data, dict):
-                                            # 构建参考资料文本
                                             ref_text = "\n\n📚 参考资料:\n"
                                             if 'medias' in context_data and isinstance(context_data['medias'], list):
-                                                for i, media in enumerate(context_data['medias'][:5], 1):  # 最多显示5个
+                                                for i, media in enumerate(context_data['medias'][:5], 1):
                                                     title = media.get('title', f'资料{i}')
                                                     intro = media.get('introduction', '')
                                                     if intro:
@@ -865,7 +704,6 @@ class IMAAPIClient:
                                                     else:
                                                         ref_text += f"{i}. {title}\n"
 
-                                            # 将参考资料作为文本消息添加
                                             if context_data.get('medias'):
                                                 messages.append(TextMessage(
                                                     type=MessageType.TEXT,
@@ -874,7 +712,6 @@ class IMAAPIClient:
                                                     raw=str(last_msg)
                                                 ))
                                     except json.JSONDecodeError:
-                                        # 如果无法解析JSON，直接作为文本处理
                                         messages.append(TextMessage(
                                             type=MessageType.TEXT,
                                             content=f"\n\n📚 参考资料:\n{context_refs}",
@@ -882,12 +719,11 @@ class IMAAPIClient:
                                             raw=str(last_msg)
                                         ))
 
-            logger.info(f"从响应中提取了 {len(messages)} 条消息（仅处理qa msgs中最后一个对象）")
+            logger.info(f"从响应中提取了 {len(messages)} 条消息")
             return messages
 
         except Exception as e:
             logger.error(f"提取消息时出错: {e}")
-            # 如果无法解析，返回原始内容作为系统消息
             messages.append(IMAMessage(
                 type=MessageType.SYSTEM,
                 content=str(response_data),
@@ -896,30 +732,16 @@ class IMAAPIClient:
             return messages
 
     async def init_session(self, knowledge_base_id: Optional[str] = None) -> str:
-        """初始化会话，获取有效的 session_id"""
-        # 使用配置中的知识库ID，如果没有提供参数
+        """初始化会话"""
         kb_id = knowledge_base_id or getattr(self.config, 'knowledge_base_id', '7305806844290061')
 
-        logger.info("=" * 60)
-        logger.info("🔄 [优化] 开始初始化会话 (init_session)")
-        logger.info(f"  知识库ID: {kb_id}")
-        logger.info(f"  当前 token 状态: {'存在' if self.config.current_token else '不存在'}")
-        logger.info(f"  token 更新时间: {self.config.token_updated_at}")
-        
-        # 提前检查并刷新 token（避免 init_session 失败）
+        logger.info(f"🔄 初始化会话 (知识库: {kb_id})")
         if not await self.ensure_valid_token():
-            logger.error("❌ [优化] 无法获取有效的访问令牌")
+            logger.error("❌ 无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
         
-        logger.info("✅ [优化] Token 验证通过，继续初始化会话")
-
         session = await self._get_session(for_init_session=True)
-        
-        # 记录当前会话的cookies和headers
-        logger.info(f"会话cookies数量: {len(session.cookie_jar)}")
-        logger.info(f"会话headers: {dict(session.headers)}")
 
-        # 构建初始化请求
         init_request = InitSessionRequest(
             envInfo=EnvInfo(
                 robotType=5,
@@ -928,38 +750,23 @@ class IMAAPIClient:
             byKeyword=kb_id,
             relatedUrl=kb_id,
             sceneType=1,
-            msgsLimit=10,
+            msgsLimit=0,
             forbidAutoAddToHistoryList=True,
             knowledgeBaseInfoWithFolder=KnowledgeBaseInfoWithFolder(
                 knowledge_base_id=kb_id,
                 folder_ids=[]
             )
         )
-
+        
         url = f"{self.base_url}{self.init_session_endpoint}"
         request_json = init_request.model_dump()
 
-        logger.info(f"初始化会话URL: {url}")
-        logger.info(f"初始化会话参数: {json.dumps(request_json, ensure_ascii=False, indent=2)}")
-
         try:
-            # 获取实际要发送的请求头
-            actual_headers = dict(session.headers)
-            actual_headers.update({"content-type": "application/json"})
-            logger.info("实际请求头（隐藏敏感信息）:")
-            for key, value in actual_headers.items():
-                if key.lower() in ['x-ima-cookie', 'authorization', 'cookie']:
-                    logger.info(f"  {key}: [已隐藏，长度={len(str(value))}]")
-                else:
-                    logger.info(f"  {key}: {value}")
-            
             async with session.post(
                 url,
                 json=request_json,
                 headers={"content-type": "application/json"}
             ) as response:
-                logger.info(f"收到响应，状态码: {response.status}")
-                
                 if response.status != 200:
                     response_text = await response.text()
                     logger.error(f"初始化会话失败，HTTP状态码: {response.status}")
@@ -969,18 +776,15 @@ class IMAAPIClient:
                 response.raise_for_status()
 
                 response_data = await response.json()
-                logger.info(f"初始化会话响应: {json.dumps(response_data, ensure_ascii=False, indent=2)}")
-
-                # 解析响应
                 init_response = InitSessionResponse(**response_data)
 
                 if init_response.code == 0 and init_response.session_id:
                     self.current_session_id = init_response.session_id
                     self.session_initialized = True
-                    logger.info(f"会话初始化成功，session_id: {self.current_session_id}")
+                    logger.info(f"✅ 会话初始化成功 (session_id: {self.current_session_id[:16]}...)")
                     return self.current_session_id
                 else:
-                    logger.error(f"会话初始化失败 (code: {init_response.code}): {init_response.msg}")
+                    logger.error(f"❌ 会话初始化失败 (code: {init_response.code}): {init_response.msg}")
                     raise ValueError(f"Session initialization failed (code: {init_response.code}): {init_response.msg}")
 
         except aiohttp.ClientError as e:
@@ -992,12 +796,7 @@ class IMAAPIClient:
 
     async def ask_question(self, question: str) -> AsyncGenerator[IMAMessage, None]:
         """向 IMA 询问问题"""
-        logger.info("=" * 80)
-        logger.info(f"🔍 [诊断] ask_question 被调用")
-        logger.info(f"  当前 session_id: {self.current_session_id}")
-        logger.info(f"  session_initialized: {self.session_initialized}")
-        logger.info(f"  HTTP session 状态: {'活跃' if self.session and not self.session.closed else '未创建或已关闭'}")
-        logger.info("=" * 80)
+        logger.debug(f"🔍 ask_question 被调用 (session: {self.current_session_id[:16] if self.current_session_id else 'None'}...)")
         
         if not question.strip():
             raise ValueError("Question cannot be empty")
@@ -1008,11 +807,9 @@ class IMAAPIClient:
             raise ValueError("Authentication failed - unable to obtain valid token")
 
         # 每次调用都初始化新会话，实现上下文隔离
-        logger.info("🔄 [诊断] 初始化新会话以实现上下文隔离...")
+        logger.debug("🔄 初始化新会话（上下文隔离）")
         
-        # ✅ 修复：强制清理旧 HTTP session，避免 cookie 污染
         if self.session and not self.session.closed:
-            logger.info("  关闭旧 HTTP session 以清除所有 cookies")
             await self.session.close()
             self.session = None
         
@@ -1020,11 +817,8 @@ class IMAAPIClient:
         self.current_session_id = None
         self.session_initialized = False
         
-        logger.info(f"  初始化前 session_id: {self.current_session_id}")
         try:
             await self.init_session()
-            logger.info(f"✅ [诊断] 会话初始化成功")
-            logger.info(f"  初始化后 session_id: {self.current_session_id}")
         except Exception as init_error:
             logger.error(f"❌ [诊断] 会话初始化失败: {init_error}")
             logger.error("  这可能是导致 'No valid session ID provided' 错误的原因")
@@ -1045,8 +839,7 @@ class IMAAPIClient:
 
         response = None
         try:
-            logger.info(f"发送问题到 {url}")
-            logger.info(f"使用 session_id: {request_json.get('session_id', 'N/A')}")
+            logger.debug(f"发送问题: {question[:50]}...")
             
             response = await session.post(
                 url,
@@ -1172,32 +965,39 @@ class IMAAPIClient:
         
         # 生成主trace_id用于整个请求
         main_trace_id = str(uuid.uuid4())[:8]
-        logger.info(f"开始完整问答请求 (main_trace_id={main_trace_id})")
+        logger.info(f"🚀 开始问答 (trace_id={main_trace_id}): {question[:50]}...")
 
         for attempt in range(max_retries + 1):  # 总共尝试 max_retries + 1 次
-            logger.info(f"尝试 {attempt + 1}/{max_retries + 1} (main_trace_id={main_trace_id})")
+            logger.debug(f"📍 尝试 {attempt + 1}/{max_retries + 1}")
             try:
                 async for message in self.ask_question(question):
                     messages.append(message)
+                    logger.debug(f"  收到消息 #{len(messages)}: {type(message).__name__}")
 
                 # 如果成功获取到消息，直接返回
                 if messages:
-                    logger.info(f"成功获取 {len(messages)} 条消息 (main_trace_id={main_trace_id})")
+                    logger.info(f"✅ 问答完成 ({len(messages)}条消息)")
                     break
+                else:
+                    logger.warning(f"⚠️ [完整问答] 未获取到任何消息，尝试次数: {attempt + 1}/{max_retries + 1}")
 
             except Exception as e:
                 error_str = str(e)
-                logger.error(f"Failed to get complete answer (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                logger.error("=" * 80)
+                logger.error(f"❌ [完整问答] 尝试 {attempt + 1}/{max_retries + 1} 失败")
+                logger.error(f"  异常类型: {type(e).__name__}")
+                logger.error(f"  异常信息: {error_str[:200]}")
+                logger.error("=" * 80)
 
                 # 检查是否是登录过期错误
                 if self._is_login_expired_error(error_str):
                     if attempt < max_retries:
-                        logger.info(f"检测到登录/认证过期错误，尝试刷新 token... (错误: {error_str[:100]})")
+                        logger.info(f"🔄 认证错误，刷新token...")
 
                         # 尝试刷新 token
                         refresh_success = await self.refresh_token()
                         if refresh_success:
-                            logger.info("Token 刷新成功，重新尝试会话初始化...")
+                            logger.info("✅ Token刷新成功，重试中...")
                             # 重置会话状态，强制重新初始化
                             self.session_initialized = False
                             self.current_session_id = None
@@ -1209,27 +1009,37 @@ class IMAAPIClient:
                             messages = []
                             continue
                         else:
-                            logger.warning("Token 刷新失败，无法恢复会话")
+                            logger.error("❌ [完整问答] Token刷新失败，停止重试")
+                            break  # 刷新失败，直接退出循环，不再重试
                     else:
-                        logger.error(f"已达到最大重试次数，token 刷新失败。原始错误: {error_str}")
+                        logger.error(f"❌ [完整问答] 已达最大重试次数 ({max_retries})，停止重试")
+                        break  # 达到最大重试次数，直接退出循环
                 else:
-                    # 如果不是登录过期错误，直接记录错误并重试
+                    # 如果不是登录过期错误，检查是否应该重试
                     if attempt < max_retries:
-                        logger.info(f"非登录过期错误，重试中... (错误: {error_str[:100]})")
+                        logger.info(f"🔄 [完整问答] 非认证错误，延迟1秒后重试...")
+                        logger.info(f"  错误摘要: {error_str[:100]}")
                         # 重置消息列表，准备重新尝试
                         messages = []
                         # 短暂延迟后重试
                         await asyncio.sleep(1)
                         continue
+                    else:
+                        logger.error(f"❌ [完整问答] 已达最大重试次数 ({max_retries})，停止重试")
+                        break  # 达到最大重试次数，直接退出循环
 
-                # 如果已经重试完成，记录最终错误
-                if attempt == max_retries:
-                    error_message = IMAMessage(
-                        type=MessageType.SYSTEM,
-                        content=f"获取回答失败: {error_str}",
-                        raw=str(e)
-                    )
-                    messages.append(error_message)
+        # 如果循环结束但没有消息，添加错误消息
+        if not messages:
+            logger.error("=" * 80)
+            logger.error(f"❌ [完整问答] 所有尝试均失败，未获取到任何消息")
+            logger.error(f"  main_trace_id: {main_trace_id}")
+            logger.error("=" * 80)
+            error_message = IMAMessage(
+                type=MessageType.SYSTEM,
+                content=f"获取回答失败: 所有 {max_retries + 1} 次尝试均失败",
+                raw="All retries exhausted"
+            )
+            messages.append(error_message)
 
         return messages
 
