@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_serializer
 from enum import Enum
 
 
@@ -192,10 +192,10 @@ class IMAConfig(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
 
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+    @field_serializer('created_at', 'updated_at')
+    def serialize_datetime(self, value: Optional[datetime]) -> Optional[str]:
+        """序列化 datetime 为 ISO 格式字符串"""
+        return value.isoformat() if value else None
 
     def is_complete(self) -> bool:
         """检查配置是否完整（包含所有必需字段）"""

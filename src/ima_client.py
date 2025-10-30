@@ -290,7 +290,7 @@ class IMAAPIClient:
                 else:
                     logger.info(f"  {key}: {value}")
             
-            request_body = refresh_request.dict()
+            request_body = refresh_request.model_dump()
             logger.info(f"请求体:")
             logger.info(f"  user_id: {request_body['user_id']}")
             logger.info(f"  refresh_token 长度: {len(request_body['refresh_token'])}")
@@ -901,13 +901,17 @@ class IMAAPIClient:
         kb_id = knowledge_base_id or getattr(self.config, 'knowledge_base_id', '7305806844290061')
 
         logger.info("=" * 60)
-        logger.info("开始初始化会话 (init_session)")
-        logger.info(f"知识库ID: {kb_id}")
+        logger.info("🔄 [优化] 开始初始化会话 (init_session)")
+        logger.info(f"  知识库ID: {kb_id}")
+        logger.info(f"  当前 token 状态: {'存在' if self.config.current_token else '不存在'}")
+        logger.info(f"  token 更新时间: {self.config.token_updated_at}")
         
-        # 确保token有效
+        # 提前检查并刷新 token（避免 init_session 失败）
         if not await self.ensure_valid_token():
-            logger.error("无法获取有效的访问令牌")
+            logger.error("❌ [优化] 无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
+        
+        logger.info("✅ [优化] Token 验证通过，继续初始化会话")
 
         session = await self._get_session(for_init_session=True)
         
@@ -988,22 +992,42 @@ class IMAAPIClient:
 
     async def ask_question(self, question: str) -> AsyncGenerator[IMAMessage, None]:
         """向 IMA 询问问题"""
+        logger.info("=" * 80)
+        logger.info(f"🔍 [诊断] ask_question 被调用")
+        logger.info(f"  当前 session_id: {self.current_session_id}")
+        logger.info(f"  session_initialized: {self.session_initialized}")
+        logger.info(f"  HTTP session 状态: {'活跃' if self.session and not self.session.closed else '未创建或已关闭'}")
+        logger.info("=" * 80)
+        
         if not question.strip():
             raise ValueError("Question cannot be empty")
 
         # 确保token有效
         if not await self.ensure_valid_token():
-            logger.error("无法获取有效的访问令牌")
+            logger.error("❌ [诊断] 无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
 
         # 每次调用都初始化新会话，实现上下文隔离
-        logger.info("初始化新会话以实现上下文隔离...")
+        logger.info("🔄 [诊断] 初始化新会话以实现上下文隔离...")
+        
+        # ✅ 修复：强制清理旧 HTTP session，避免 cookie 污染
+        if self.session and not self.session.closed:
+            logger.info("  关闭旧 HTTP session 以清除所有 cookies")
+            await self.session.close()
+            self.session = None
+        
+        # 重置会话状态
+        self.current_session_id = None
+        self.session_initialized = False
+        
+        logger.info(f"  初始化前 session_id: {self.current_session_id}")
         try:
             await self.init_session()
-            logger.info(f"会话初始化成功，session_id: {self.current_session_id}")
+            logger.info(f"✅ [诊断] 会话初始化成功")
+            logger.info(f"  初始化后 session_id: {self.current_session_id}")
         except Exception as init_error:
-            logger.error(f"会话初始化失败: {init_error}")
-            logger.error("这可能是导致 'No valid session ID provided' 错误的原因")
+            logger.error(f"❌ [诊断] 会话初始化失败: {init_error}")
+            logger.error("  这可能是导致 'No valid session ID provided' 错误的原因")
             raise
 
         session = await self._get_session()
@@ -1033,19 +1057,24 @@ class IMAAPIClient:
             # 检查响应状态
             if response.status != 200:
                 response_text = await response.text()
-                logger.error(f"HTTP请求失败，状态码: {response.status}")
-                logger.error(f"响应内容: {response_text[:500]}...")
+                logger.error(f"❌ [诊断] HTTP请求失败，状态码: {response.status}")
+                logger.error(f"  响应内容: {response_text[:500]}...")
                 
                 # 特别检查 400 错误和 session ID 相关的问题
                 if response.status == 400:
-                    logger.error("=" * 60)
-                    logger.error("收到 HTTP 400 错误 - 可能的原因:")
-                    logger.error("1. session_id 无效或已过期")
-                    logger.error("2. 认证信息（cookies/headers）无效")
-                    logger.error("3. 请求参数格式错误")
-                    logger.error(f"当前使用的 session_id: {self.current_session_id}")
-                    logger.error(f"会话初始化状态: {self.session_initialized}")
-                    logger.error("=" * 60)
+                    logger.error("=" * 80)
+                    logger.error("🚨 [诊断] 收到 HTTP 400 错误 - 详细诊断信息:")
+                    logger.error("  可能的原因:")
+                    logger.error("    1. session_id 无效或已过期")
+                    logger.error("    2. 认证信息（cookies/headers）无效")
+                    logger.error("    3. 请求参数格式错误")
+                    logger.error(f"  当前使用的 session_id: {self.current_session_id}")
+                    logger.error(f"  会话初始化状态: {self.session_initialized}")
+                    logger.error(f"  HTTP session 对象: {self.session}")
+                    logger.error(f"  HTTP session 是否关闭: {self.session.closed if self.session else 'N/A'}")
+                    logger.error(f"  Token 是否存在: {bool(self.config.current_token)}")
+                    logger.error(f"  Token 更新时间: {self.config.token_updated_at}")
+                    logger.error("=" * 80)
                 
                 raise ValueError(f"HTTP请求失败: {response.status} - {response_text[:200]}")
 
