@@ -56,4 +56,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081').read()" || exit 1
 
 # Run the MCP server
-CMD ["python", "-m", "fastmcp", "run", "ima_server_simple.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["fastmcp", "run", "ima_server_simple.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8081"]
