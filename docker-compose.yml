@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  ima-mcp-server:
+    image: highkay/tencent-ima-copilot-mcp:latest
+    container_name: ima-copilot-mcp
+    restart: unless-stopped
+
+    # Required environment variables - MUST be provided
+    environment:
+      # ===== 必需配置 =====
+      # 从浏览器开发者工具获取（详见 README.md）
+      IMA_X_IMA_COOKIE: "${IMA_X_IMA_COOKIE}"
+      IMA_X_IMA_BKN: "${IMA_X_IMA_BKN}"
+      IMA_KNOWLEDGE_BASE_ID: "${IMA_KNOWLEDGE_BASE_ID}"
+
+      # ===== 可选配置（已有默认值）=====
+      # 完整的 Cookie 字符串（可选）
+      # IMA_COOKIES: "${IMA_COOKIES:-}"
+
+      # 设备标识和客户端ID（留空则自动生成）
+      # IMA_USKEY: "${IMA_USKEY:-}"
+      # IMA_CLIENT_ID: "${IMA_CLIENT_ID:-}"
+
+      # 服务器配置
+      IMA_MCP_HOST: "0.0.0.0"
+      IMA_MCP_PORT: "8081"
+      IMA_MCP_DEBUG: "${IMA_MCP_DEBUG:-false}"
+      IMA_MCP_LOG_LEVEL: "${IMA_MCP_LOG_LEVEL:-INFO}"
+
+      # API 配置
+      IMA_REQUEST_TIMEOUT: "${IMA_REQUEST_TIMEOUT:-30}"
+      IMA_RETRY_COUNT: "${IMA_RETRY_COUNT:-3}"
+
+      # 代理设置（可选）
+      # IMA_PROXY: "${IMA_PROXY:-}"
+
+    ports:
+      - "8081:8081"
+
+    # 持久化日志
+    volumes:
+      - ./logs:/app/logs
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+    # Resource limits (optional, adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
